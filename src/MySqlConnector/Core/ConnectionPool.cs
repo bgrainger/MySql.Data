@@ -1,7 +1,10 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Security.Authentication;
 using System.Threading;
 using System.Threading.Tasks;
@@ -14,6 +17,21 @@ namespace MySqlConnector.Core
 {
 	internal sealed class ConnectionPool
 	{
+		// General
+		//
+		// * When we're at capacity (Busy==Max) further open attempts wait until someone releases.
+		//   This must happen in FIFO (first to block on open is the first to release), otherwise some attempts may get
+		//   starved and time out. This is why we use a ConcurrentQueue.
+		// * We must avoid a race condition whereby an open attempt starts waiting at the same time as another release
+		//   puts a connector back into the idle list. This would potentially make the waiter wait forever/time out.
+		//
+		// Rules
+		// * You *only* create a new connector if Total < Max.
+		// * You *only* go into waiting if Busy == Max (which also implies Idle == 0)
+		//
+		// Implementation taken from https://github.com/npgsql/npgsql/blob/6f5e936ba3cff2c71e914528a282fa0d7f683c78/src/Npgsql/ConnectorPool.cs
+		// This implementation should be kept up-to-date with changes in that code.
+
 		public int Id { get; }
 
 		public ConnectionSettings ConnectionSettings { get; }
@@ -27,35 +45,27 @@ namespace MySqlConnector.Core
 			// if all sessions are used, see if any have been leaked and can be recovered
 			// check at most once per second (although this isn't enforced via a mutex so multiple threads might block
 			// on the lock in RecoverLeakedSessions in high-concurrency situations
-			if (m_sessionSemaphore.CurrentCount == 0 && unchecked(((uint) Environment.TickCount) - m_lastRecoveryTime) >= 1000u)
+			if (m_state.Busy == m_maximumPoolSize && unchecked(((uint) Environment.TickCount) - m_lastRecoveryTime) >= 1000u)
 			{
-				Log.Info("Pool{0} is empty; recovering leaked sessions", m_logArguments);
+				Log.Debug("Pool{0} is empty; checking for leaked sessions", m_logArguments);
 				RecoverLeakedSessions();
 			}
 
-			if (ConnectionSettings.MinimumPoolSize > 0)
-				await CreateMinimumPooledSessions(ioBehavior, cancellationToken).ConfigureAwait(false);
+#if !NETSTANDARD1_3
+			Thread.Sleep(1);
+#endif
 
-			// wait for an open slot (until the cancellationToken is cancelled, which is typically due to timeout)
-			Log.Debug("Pool{0} waiting for an available session", m_logArguments);
-			if (ioBehavior == IOBehavior.Asynchronous)
-				await m_sessionSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
-			else
-				m_sessionSemaphore.Wait(cancellationToken);
+			Log.Debug("Pool{0} checking for an available session", m_logArguments);
+			if (!TryAllocateFast(out var session))
+			{
+				// create a new session (if the pool isn't full), or wait for one
+				session = await AllocateLong(connection, ioBehavior, cancellationToken).ConfigureAwait(false);
+			}
 
-			ServerSession session = null;
 			try
 			{
-				// check for a waiting session
-				lock (m_sessions)
-				{
-					if (m_sessions.Count > 0)
-					{
-						session = m_sessions.First.Value;
-						m_sessions.RemoveFirst();
-					}
-				}
-				if (session != null)
+				// if LastReturnedTicks==0, the session is newly created
+				if (session.LastReturnedTicks != 0)
 				{
 					Log.Debug("Pool{0} found an existing session; checking it for validity", m_logArguments);
 					bool reuseSession;
@@ -81,63 +91,38 @@ namespace MySqlConnector.Core
 						}
 					}
 
-					if (!reuseSession)
-					{
-						// session is either old or cannot communicate with the server
-						Log.Warn("Pool{0} Session{1} is unusable; destroying it", m_logArguments[0], session.Id);
-						AdjustHostConnectionCount(session, -1);
-						await session.DisposeAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
-					}
-					else
+					if (reuseSession)
 					{
 						// pooled session is ready to be used; return it
 						session.OwningConnection = new WeakReference<MySqlConnection>(connection);
-						int leasedSessionsCountPooled;
-						lock (m_leasedSessions)
-						{
-							m_leasedSessions.Add(session.Id, session);
-							leasedSessionsCountPooled = m_leasedSessions.Count;
-						}
+						AddBusySession(session);
 						if (Log.IsDebugEnabled())
-							Log.Debug("Pool{0} returning pooled Session{1} to caller; LeasedSessionsCount={2}", m_logArguments[0], session.Id, leasedSessionsCountPooled);
+							Log.Debug("Pool{0} returning pooled Session{1} to caller; BusySessionsCount={2}", m_logArguments[0], session.Id, m_state.Busy);
 						return session;
 					}
+
+					// session is either old or cannot communicate with the server
+					Log.Warn("Pool{0} Session{1} is unusable; destroying it", m_logArguments[0], session.Id);
+					AdjustHostConnectionCount(session, -1);
+					await session.DisposeAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
+
+					// create a new session
+					session = new ServerSession(this, m_generation, Interlocked.Increment(ref m_lastSessionId));
+					if (Log.IsInfoEnabled())
+						Log.Info("Pool{0} no pooled session available; created new Session{1}", m_logArguments[0], session.Id);
+					await session.ConnectAsync(ConnectionSettings, m_loadBalancer, ioBehavior, cancellationToken).ConfigureAwait(false);
 				}
 
-				// create a new session
-				session = new ServerSession(this, m_generation, Interlocked.Increment(ref m_lastSessionId));
-				if (Log.IsInfoEnabled())
-					Log.Info("Pool{0} no pooled session available; created new Session{1}", m_logArguments[0], session.Id);
-				await session.ConnectAsync(ConnectionSettings, m_loadBalancer, ioBehavior, cancellationToken).ConfigureAwait(false);
 				AdjustHostConnectionCount(session, 1);
 				session.OwningConnection = new WeakReference<MySqlConnection>(connection);
-				int leasedSessionsCountNew;
-				lock (m_leasedSessions)
-				{
-					m_leasedSessions.Add(session.Id, session);
-					leasedSessionsCountNew = m_leasedSessions.Count;
-				}
+				AddBusySession(session);
 				if (Log.IsDebugEnabled())
-					Log.Debug("Pool{0} returning new Session{1} to caller; LeasedSessionsCount={2}", m_logArguments[0], session.Id, leasedSessionsCountNew);
+					Log.Debug("Pool{0} returning new Session{1} to caller; BusySessionsCount={2}", m_logArguments[0], session.Id, m_state.Busy);
 				return session;
 			}
 			catch (Exception ex)
 			{
-				if (session != null)
-				{
-					try
-					{
-						Log.Debug(ex, "Pool{0} disposing created Session{1} due to exception: {2}", m_logArguments[0], session.Id, ex.Message);
-						AdjustHostConnectionCount(session, -1);
-						await session.DisposeAsync(ioBehavior, CancellationToken.None).ConfigureAwait(false);
-					}
-					catch (Exception unexpectedException)
-					{
-						Log.Error(unexpectedException, "Pool{0} unexpected error in GetSessionAsync: {1}", m_logArguments[0], unexpectedException.Message);
-					}
-				}
-
-				m_sessionSemaphore.Release();
+				HandleExceptionCreatingSession(ex, session);
 				throw;
 			}
 		}
@@ -161,48 +146,149 @@ namespace MySqlConnector.Core
 			if (Log.IsDebugEnabled())
 				Log.Debug("Pool{0} receiving Session{1} back", m_logArguments[0], session.Id);
 
-			try
+			// remove the session from the array of busy sessions
+			var foundSession = false;
+			for (var i = 0; i < m_busySessions.Length; i++)
 			{
-				lock (m_leasedSessions)
-					m_leasedSessions.Remove(session.Id);
-				session.OwningConnection = null;
-				var sessionHealth = GetSessionHealth(session);
-				if (sessionHealth == 0)
+				if (object.ReferenceEquals(m_busySessions[i], session))
 				{
-					lock (m_sessions)
-						m_sessions.AddFirst(session);
-				}
-				else
-				{
-					if (sessionHealth == 1)
-						Log.Warn("Pool{0} received invalid Session{1}; destroying it", m_logArguments[0], session.Id);
-					else
-						Log.Info("Pool{0} received expired Session{1}; destroying it", m_logArguments[0], session.Id);
-					AdjustHostConnectionCount(session, -1);
-					session.DisposeAsync(IOBehavior.Synchronous, CancellationToken.None).GetAwaiter().GetResult();
+					// there's no contention for this slot, but we want to ensure the null is published
+					Interlocked.Exchange(ref m_busySessions[i], null);
+					foundSession = true;
 				}
 			}
-			finally
+			if (!foundSession)
 			{
-				m_sessionSemaphore.Release();
+				Log.Error("Pool{0} didn't find busy session when returning Session{1}", m_logArguments[0], session.Id);
+				throw new InvalidOperationException("Pool{0} didn't find busy session when returning Session{1}".FormatInvariant(m_logArguments[0], session.Id));
+			}
+
+			session.OwningConnection = null;
+			var sessionHealth = GetSessionHealth(session);
+			if (sessionHealth != 0)
+			{
+				if (sessionHealth == 1)
+					Log.Warn("Pool{0} received invalid Session{1}; destroying it", m_logArguments[0], session.Id);
+				else
+					Log.Info("Pool{0} received expired Session{1}; destroying it", m_logArguments[0], session.Id);
+				AdjustHostConnectionCount(session, -1);
+				CloseSession(session, wasIdle: false);
+				return;
+			}
+
+			var sw = new SpinWait();
+
+			while (true)
+			{
+				var state = m_state.Copy();
+
+				// If there are any pending open attempts in progress hand the session off to them directly.
+				// Note that in this case, state changes (i.e. decrementing m_state.Waiting) happens at the allocating
+				// side.
+				if (state.Waiting > 0)
+				{
+					if (!m_waiting.TryDequeue(out var waitingOpenAttempt))
+					{
+						// _waitingCount has been increased, but there's nothing in the queue yet - someone is in the
+						// process of enqueuing an open attempt. Wait and retry.
+						sw.SpinOnce();
+						continue;
+					}
+
+					var tcs = waitingOpenAttempt.TaskCompletionSource;
+
+					// We have a pending open attempt. "Complete" it, handing off the session.
+#if !NET45
+					if (!tcs.TrySetResult(session))
+					{
+						// If the open attempt timed out, the Task's state will be set to Canceled and our TrySetResult fails. Try again.
+						Debug.Assert(tcs.Task.IsCanceled);
+						continue;
+					}
+#else
+					if (waitingOpenAttempt.IsAsync)
+					{
+						// If the waiting open attempt is asynchronous (i.e. OpenAsync()), we can't simply
+						// call SetResult on its TaskCompletionSource, since it would execute the open's
+						// continuation in our thread (the closing thread). Instead we schedule the completion
+						// to run in the thread pool via Task.Run().
+
+						// We copy tcs2 and especially connector2 to avoid allocations caused by the closure, see
+						// http://stackoverflow.com/questions/41507166/closure-heap-allocation-happening-at-start-of-method
+						var tcs2 = tcs;
+						var connector2 = session;
+
+						// TODO: When we drop support for .NET Framework 4.5, switch to RunContinuationsAsynchronously
+						Task.Run(() =>
+						{
+							if (!tcs2.TrySetResult(connector2))
+							{
+								// If the open attempt timed out, the Task's state will be set to Canceled and our
+								// TrySetResult fails.
+								// "Recursively" call Release() again, this will dequeue another open attempt and retry.
+								Debug.Assert(tcs2.Task.IsCanceled);
+								Return(connector2);
+							}
+						});
+					}
+					else if (!tcs.TrySetResult(session))  // Open attempt is sync
+					{
+						// If the open attempt timed out, the Task's state will be set to Canceled and our
+						// TrySetResult fails. Try again.
+						Debug.Assert(tcs.Task.IsCanceled);
+						continue;
+					}
+#endif
+
+					return;
+				}
+
+				// There were no waiting attempts. However, there's a race condition where a new waiting attempt
+				// may occur as we're putting our session into the idle list. Decrement the busy
+				// count, while atomically make sure the waiting count isn't increased.
+				// Note that we also must update the state *before* putting the session back in the idle list.
+				var newState = state;
+				newState.Idle++;
+				newState.Busy--;
+				CheckInvariants(newState);
+				if (Interlocked.CompareExchange(ref m_state.All, newState.All, state.All) != state.All)
+				{
+					// Our attempt to decrement the busy count failed, either because a waiting attempt has been added
+					// or busy has changed. Loop again and retry.
+					continue;
+				}
+
+				// If we're here, we successfully applied the new state above and can put the session back in the idle
+				// list (there were no pending open attempts).
+
+				var ticks = unchecked((uint) Environment.TickCount);
+				if (ticks == 0)
+					ticks = 1;
+				session.LastReturnedTicks = ticks;
+
+				sw = new SpinWait();
+				while (true)
+				{
+					// place returned sessions starting at the end of the array so the pool has stack-like behaviour (i.e.,
+					// the most-recently-returned session is more likely to be returned by the next call to TryAllocateFast)
+					for (var i = m_idleSessions.Length - 1; i >= 0; i--)
+					{
+						if (m_idleSessions[i] is null && Interlocked.CompareExchange(ref m_idleSessions[i], session, null) is null)
+							return;
+					}
+
+					sw.SpinOnce();
+				}
 			}
 		}
 
-		public async Task ClearAsync(IOBehavior ioBehavior, CancellationToken cancellationToken)
+		public Task ClearAsync(IOBehavior ioBehavior, CancellationToken cancellationToken)
 		{
-			// increment the generation of the connection pool
 			Log.Info("Pool{0} clearing connection pool", m_logArguments);
-			Interlocked.Increment(ref m_generation);
 			m_procedureCache = null;
 			RecoverLeakedSessions();
-			await CleanPoolAsync(ioBehavior, session => session.PoolGeneration != m_generation, false, cancellationToken).ConfigureAwait(false);
-		}
-
-		public async Task ReapAsync(IOBehavior ioBehavior, CancellationToken cancellationToken)
-		{
-			Log.Debug("Pool{0} reaping connection pool", m_logArguments);
-			RecoverLeakedSessions();
-			await CleanPoolAsync(ioBehavior, session => (unchecked((uint) Environment.TickCount) - session.LastReturnedTicks) / 1000 >= ConnectionSettings.ConnectionIdleTimeout, true, cancellationToken).ConfigureAwait(false);
+			Clear();
+			return Utility.CompletedTask;
 		}
 
 		/// <summary>
@@ -223,140 +309,39 @@ namespace MySqlConnector.Core
 		}
 
 		/// <summary>
-		/// Examines all the <see cref="ServerSession"/> objects in <see cref="m_leasedSessions"/> to determine if any
+		/// Examines all the <see cref="ServerSession"/> objects in <see cref="m_busySessions"/> to determine if any
 		/// have an owning <see cref="MySqlConnection"/> that has been garbage-collected. If so, assumes that the connection
 		/// was not properly disposed and returns the session to the pool.
 		/// </summary>
 		private void RecoverLeakedSessions()
 		{
-			var recoveredSessions = new List<ServerSession>();
-			lock (m_leasedSessions)
+			// simplistic mutex by verifying that only one thread has attempted to recover in the last second
+			lock (m_busySessions)
 			{
+				if (unchecked(((uint) Environment.TickCount) - m_lastRecoveryTime) < 1000u)
+					return;
 				m_lastRecoveryTime = unchecked((uint) Environment.TickCount);
-				foreach (var session in m_leasedSessions.Values)
+			}
+
+			var recoveredSessions = default(List<ServerSession>);
+			foreach (var session in m_busySessions)
+			{
+				if (!(session?.OwningConnection.TryGetTarget(out var _) ?? true))
 				{
-					if (!session.OwningConnection.TryGetTarget(out var _))
-						recoveredSessions.Add(session);
+					if (recoveredSessions is null)
+						recoveredSessions = new List<ServerSession>();
+					recoveredSessions.Add(session);
 				}
 			}
-			if (recoveredSessions.Count == 0)
-				Log.Debug("Pool{0} recovered no sessions", m_logArguments);
-			else
+			if (recoveredSessions?.Count > 0)
+			{
 				Log.Warn("Pool{0}: RecoveredSessionCount={1}", m_logArguments[0], recoveredSessions.Count);
-			foreach (var session in recoveredSessions)
-				session.ReturnToPool();
-		}
-
-		private async Task CleanPoolAsync(IOBehavior ioBehavior, Func<ServerSession, bool> shouldCleanFn, bool respectMinPoolSize, CancellationToken cancellationToken)
-		{
-			// synchronize access to this method as only one clean routine should be run at a time
-			if (ioBehavior == IOBehavior.Asynchronous)
-				await m_cleanSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+				foreach (var session in recoveredSessions)
+					Return(session);
+			}
 			else
-				m_cleanSemaphore.Wait(cancellationToken);
-
-			try
 			{
-				var waitTimeout = TimeSpan.FromMilliseconds(10);
-				while (true)
-				{
-					// if respectMinPoolSize is true, return if (leased sessions + waiting sessions <= minPoolSize)
-					if (respectMinPoolSize)
-						lock (m_sessions)
-							if (ConnectionSettings.MaximumPoolSize - m_sessionSemaphore.CurrentCount + m_sessions.Count <= ConnectionSettings.MinimumPoolSize)
-								return;
-
-					// try to get an open slot; if this fails, connection pool is full and sessions will be disposed when returned to pool
-					if (ioBehavior == IOBehavior.Asynchronous)
-					{
-						if (!await m_sessionSemaphore.WaitAsync(waitTimeout, cancellationToken).ConfigureAwait(false))
-							return;
-					}
-					else
-					{
-						if (!m_sessionSemaphore.Wait(waitTimeout, cancellationToken))
-							return;
-					}
-
-					try
-					{
-						// check for a waiting session
-						ServerSession session = null;
-						lock (m_sessions)
-						{
-							if (m_sessions.Count > 0)
-							{
-								session = m_sessions.Last.Value;
-								m_sessions.RemoveLast();
-							}
-						}
-						if (session == null)
-							return;
-
-						if (shouldCleanFn(session))
-						{
-							// session should be cleaned; dispose it and keep iterating
-							Log.Info("Pool{0} found Session{1} to clean up", m_logArguments[0], session.Id);
-							await session.DisposeAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
-						}
-						else
-						{
-							// session should not be cleaned; put it back in the queue and stop iterating
-							lock (m_sessions)
-								m_sessions.AddLast(session);
-							return;
-						}
-					}
-					finally
-					{
-						m_sessionSemaphore.Release();
-					}
-				}
-			}
-			finally
-			{
-				m_cleanSemaphore.Release();
-			}
-		}
-
-		private async Task CreateMinimumPooledSessions(IOBehavior ioBehavior, CancellationToken cancellationToken)
-		{
-			while (true)
-			{
-				lock (m_sessions)
-				{
-					// check if the desired minimum number of sessions have been created
-					if (ConnectionSettings.MaximumPoolSize - m_sessionSemaphore.CurrentCount + m_sessions.Count >= ConnectionSettings.MinimumPoolSize)
-						return;
-				}
-
-				// acquire the semaphore, to ensure that the maximum number of sessions isn't exceeded; if it can't be acquired,
-				// we have reached the maximum number of sessions and no more need to be created
-				if (ioBehavior == IOBehavior.Asynchronous)
-				{
-					if (!await m_sessionSemaphore.WaitAsync(0, cancellationToken).ConfigureAwait(false))
-						return;
-				}
-				else
-				{
-					if (!m_sessionSemaphore.Wait(0, cancellationToken))
-						return;
-				}
-
-				try
-				{
-					var session = new ServerSession(this, m_generation, Interlocked.Increment(ref m_lastSessionId));
-					Log.Info("Pool{0} created Session{1} to reach minimum pool size", m_logArguments[0], session.Id);
-					await session.ConnectAsync(ConnectionSettings, m_loadBalancer, ioBehavior, cancellationToken).ConfigureAwait(false);
-					AdjustHostConnectionCount(session, 1);
-					lock (m_sessions)
-						m_sessions.AddFirst(session);
-				}
-				finally
-				{
-					// connection is in pool; semaphore shouldn't be held any more
-					m_sessionSemaphore.Release();
-				}
+				Log.Debug("Pool{0} recovered no sessions", m_logArguments);
 			}
 		}
 
@@ -403,7 +388,6 @@ namespace MySqlConnector.Core
 			if (pool == newPool)
 			{
 				s_mruCache = new ConnectionStringPool(connectionString, pool);
-				pool.StartReaperTask();
 
 				// if we won the race to create the new pool, also store it under the original connection string
 				if (connectionString != normalizedConnectionString)
@@ -440,10 +424,12 @@ namespace MySqlConnector.Core
 			ConnectionSettings = cs;
 			SslProtocols = Utility.GetDefaultSslProtocols();
 			m_generation = 0;
-			m_cleanSemaphore = new SemaphoreSlim(1);
-			m_sessionSemaphore = new SemaphoreSlim(cs.MaximumPoolSize);
-			m_sessions = new LinkedList<ServerSession>();
-			m_leasedSessions = new Dictionary<string, ServerSession>();
+			m_maximumPoolSize = cs.MaximumPoolSize;
+			m_minimumPoolSize = cs.MinimumPoolSize;
+			m_pruningInterval = TimeSpan.FromSeconds(Math.Max(1, Math.Min(60, ConnectionSettings.ConnectionIdleTimeout / 2)));
+			m_idleSessions = new ServerSession[m_maximumPoolSize];
+			m_waiting = new ConcurrentQueue<OpenAttempt>();
+			m_busySessions = new ServerSession[m_maximumPoolSize];
 			if (cs.LoadBalance == MySqlLoadBalance.LeastConnections)
 			{
 				m_hostSessions = new Dictionary<string, int>();
@@ -461,31 +447,6 @@ namespace MySqlConnector.Core
 			m_logArguments = new object[] { "{0}".FormatInvariant(Id) };
 			if (Log.IsInfoEnabled())
 				Log.Info("Pool{0} creating new connection pool for ConnectionString: {1}", m_logArguments[0], cs.ConnectionStringBuilder.GetConnectionString(includePassword: false));
-		}
-
-		private void StartReaperTask()
-		{
-			if (ConnectionSettings.ConnectionIdleTimeout > 0)
-			{
-				var reaperInterval = TimeSpan.FromSeconds(Math.Max(1, Math.Min(60, ConnectionSettings.ConnectionIdleTimeout / 2)));
-				m_reaperTask = Task.Run(async () =>
-				{
-					while (true)
-					{
-						var task = Task.Delay(reaperInterval);
-						try
-						{
-							using (var source = new CancellationTokenSource(reaperInterval))
-								await ReapAsync(IOBehavior.Asynchronous, source.Token).ConfigureAwait(false);
-						}
-						catch
-						{
-							// do nothing; we'll try to reap again
-						}
-						await task.ConfigureAwait(false);
-					}
-				});
-			}
 		}
 
 		private void AdjustHostConnectionCount(ServerSession session, int delta)
@@ -522,6 +483,41 @@ namespace MySqlConnector.Core
 			public ConnectionPool Pool { get; }
 		}
 
+		private readonly struct OpenAttempt
+		{
+			public OpenAttempt(TaskCompletionSource<ServerSession> taskCompletionSource, bool isAsync)
+			{
+				TaskCompletionSource = taskCompletionSource;
+				IsAsync = isAsync;
+			}
+
+			public readonly TaskCompletionSource<ServerSession> TaskCompletionSource;
+			public readonly bool IsAsync;
+		}
+
+		[StructLayout(LayoutKind.Explicit)]
+		private struct PoolState
+		{
+			[FieldOffset(0)]
+			public short Idle;
+			[FieldOffset(2)]
+			public short Busy;
+			[FieldOffset(4)]
+			public short Waiting;
+			[FieldOffset(0)]
+			public long All;
+
+			public int Total => Idle + Busy;
+
+			public PoolState Copy() => new PoolState { All = Volatile.Read(ref All) };
+
+			public override string ToString()
+			{
+				var state = Copy();
+				return $"[{state.Total} total, {state.Idle} idle, {state.Busy} busy, {state.Waiting} waiting]";
+			}
+		}
+
 #if !NETSTANDARD1_3
 		static ConnectionPool()
 		{
@@ -532,6 +528,368 @@ namespace MySqlConnector.Core
 		static void OnAppDomainShutDown(object sender, EventArgs e) => ClearPoolsAsync(IOBehavior.Synchronous, CancellationToken.None).GetAwaiter().GetResult();
 #endif
 
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		private void AddBusySession(ServerSession session)
+		{
+			var sw = new SpinWait();
+			while (true)
+			{
+				// try to find the first open slot in the array, and store the session there
+				for (var i = 0; i < m_busySessions.Length; i++)
+				{
+					if (m_busySessions[i] is null && Interlocked.CompareExchange(ref m_busySessions[i], session, null) is null)
+						return;
+				}
+
+				sw.SpinOnce();
+			}
+		}
+
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		private bool TryAllocateFast(out ServerSession session)
+		{
+			// Idle may indicate that there are idle connectors, with the subsequent scan failing to find any.
+			// This can happen because of race conditions with Release(), which updates Idle before actually putting
+			// the session in the list, or because of other allocation attempts, which remove the session from
+			// the idle list before updating Idle.
+			// Loop until either m_state.Idle is 0 or you manage to remove a session.
+			session = null;
+			while (Volatile.Read(ref m_state.Idle) > 0)
+			{
+				// read from the front of the array to simulate stack-like behaviour (see comment in Return)
+				for (var i = 0; i < m_idleSessions.Length; i++)
+				{
+					// First check without an Interlocked operation, it's faster
+					// If we see a session in this slot, atomically exchange it with a null.
+					// Either we get a session out which we can use, or we get null because
+					// someone has taken it in the meanwhile. Either way put a null in its place.
+					if (!(m_idleSessions[i] is null) && !((session = Interlocked.Exchange(ref m_idleSessions[i], null)) is null))
+						break;
+				}
+
+				if (session is null)
+					return false;
+
+				// We successfully extracted an idle session, update state
+				var sw = new SpinWait();
+				while (true)
+				{
+					var state = m_state.Copy();
+					var newState = state;
+					newState.Busy++;
+					newState.Idle--;
+					CheckInvariants(newState);
+					if (Interlocked.CompareExchange(ref m_state.All, newState.All, state.All) == state.All)
+						return true;
+					sw.SpinOnce();
+				}
+			}
+
+			session = null;
+			return false;
+		}
+
+		private async ValueTask<ServerSession> AllocateLong(MySqlConnection connection, IOBehavior ioBehavior, CancellationToken cancellationToken)
+		{
+			// No idle session was found in the pool.
+			// We now loop until one of three things happen:
+			// 1. The pool isn't at max capacity (Total < Max), so we can create a new physical connection.
+			// 2. The pool is at maximum capacity and there are no idle connectors (Busy == Max),
+			// so we enqueue an open attempt into the waiting queue, so that the next release will unblock it.
+			// 3. An session makes it into the idle list (race condition with another Release().
+			while (true)
+			{
+				ServerSession session;
+				var state = m_state.Copy();
+				var newState = state;
+
+				if (state.Total < m_maximumPoolSize)
+				{
+					// We're under the pool's max capacity, try to "allocate" a slot for a new physical connection.
+					newState.Busy++;
+					CheckInvariants(newState);
+					if (Interlocked.CompareExchange(ref m_state.All, newState.All, state.All) != state.All)
+					{
+						// Our attempt to increment the busy count failed, Loop again and retry.
+						continue;
+					}
+
+					// We've managed to increase the busy counter, open a physical connection
+					session = new ServerSession(this, m_generation, Interlocked.Increment(ref m_lastSessionId));
+					if (Log.IsInfoEnabled())
+						Log.Info("Pool{0} no pooled session available; created new Session{1}", m_logArguments[0], session.Id);
+
+					try
+					{
+						await session.ConnectAsync(ConnectionSettings, m_loadBalancer, ioBehavior, cancellationToken).ConfigureAwait(false);
+					}
+					catch (Exception ex)
+					{
+						HandleExceptionCreatingSession(ex, session);
+						throw;
+					}
+
+					// Start the pruning timer if we're above MinPoolSize
+					if (m_pruningTimer is null && newState.Total > m_minimumPoolSize)
+					{
+						Log.Debug("Pool{0} starting pruning timer", m_logArguments);
+						var newPruningTimer = new Timer(PruneIdleConnectors, null, Timeout.Infinite, Timeout.Infinite);
+						if (Interlocked.CompareExchange(ref m_pruningTimer, newPruningTimer, null) is null)
+						{
+							newPruningTimer.Change(m_pruningInterval, m_pruningInterval);
+						}
+						else
+						{
+							// Someone beat us to it
+							newPruningTimer.Dispose();
+						}
+					}
+
+					return session;
+				}
+
+				if (state.Busy == m_maximumPoolSize)
+				{
+					// Pool is exhausted. Increase the waiting count while atomically making sure the busy count
+					// doesn't decrease (otherwise we have a new idle session).
+					newState.Waiting++;
+					CheckInvariants(newState);
+					if (Interlocked.CompareExchange(ref m_state.All, newState.All, state.All) != state.All)
+					{
+						// Our attempt to increment the waiting count failed, either because a session became idle (busy
+						// changed) or the waiting count changed. Loop again and retry.
+						continue;
+					}
+
+					// At this point the waiting count is non-zero, so new release calls are blocking on the waiting
+					// queue. This avoids a race condition where we wait while another session is put back in the
+					// idle list - we know the idle list is empty and will stay empty.
+					Log.Debug("Pool{0} waiting for an available session", m_logArguments);
+
+					try
+					{
+						// Enqueue an open attempt into the waiting queue so that the next release attempt will unblock us.
+#if !NET45
+						var tcs = new TaskCompletionSource<ServerSession>(TaskCreationOptions.RunContinuationsAsynchronously);
+#else
+						var tcs = new TaskCompletionSource<ServerSession>();
+#endif
+						m_waiting.Enqueue(new OpenAttempt(tcs, ioBehavior == IOBehavior.Asynchronous));
+
+						try
+						{
+							using (cancellationToken.Register(() => tcs.SetCanceled()))
+							{
+								if (ioBehavior == IOBehavior.Asynchronous)
+									await tcs.Task.ConfigureAwait(false);
+								else
+									tcs.Task.GetAwaiter().GetResult();
+							}
+						}
+						catch (Exception)
+						{
+							// We're here if the cancellation token was triggered (possibly due to timeout)
+							// Transition our Task to cancelled, so that the next time someone releases
+							// a connection they'll skip over it.
+							tcs.TrySetCanceled();
+
+							// There's still a chance of a race condition, whereby the task was transitioned to
+							// completed in the meantime.
+							if (tcs.Task.Status != TaskStatus.RanToCompletion)
+								throw;
+						}
+
+						Debug.Assert(tcs.Task.IsCompleted);
+						session = tcs.Task.Result;
+
+						// Our task completion may contain a null in order to unblock us, allowing us to try
+						// allocating again.
+						if (session is null)
+						{
+							Log.Debug("Pool{0} waiting received null session; trying again", m_logArguments);
+							continue;
+						}
+
+						return session;
+					}
+					finally
+					{
+						// The allocation attempt succeeded or timed out, decrement the waiting count
+						var sw = new SpinWait();
+						while (true)
+						{
+							state = m_state.Copy();
+							newState = state;
+							newState.Waiting--;
+							CheckInvariants(newState);
+							if (Interlocked.CompareExchange(ref m_state.All, newState.All, state.All) == state.All)
+								break;
+							sw.SpinOnce();
+						}
+					}
+				}
+
+				// We didn't create a new session or start waiting, which means there's a new idle session, try
+				// getting it
+				Debug.Assert(state.Idle > 0);
+				if (TryAllocateFast(out session))
+					return session;
+			}
+
+			// Cannot be here
+		}
+
+		private void HandleExceptionCreatingSession(Exception ex, ServerSession session)
+		{
+			if (session != null)
+			{
+				try
+				{
+					Log.Debug(ex, "Pool{0} disposing created Session{1} due to exception: {2}", m_logArguments[0], session.Id, ex.Message);
+					AdjustHostConnectionCount(session, -1);
+					session.DisposeAsync(IOBehavior.Synchronous, CancellationToken.None).GetAwaiter().GetResult();
+				}
+				catch (Exception unexpectedException)
+				{
+					Log.Error(unexpectedException, "Pool{0} unexpected error in GetSessionAsync: {1}", m_logArguments[0], unexpectedException.Message);
+				}
+			}
+
+			// physical open failed, decrement busy back down
+			var sw = new SpinWait();
+			while (true)
+			{
+				var state = m_state.Copy();
+				var newState = state;
+				newState.Busy--;
+				if (Interlocked.CompareExchange(ref m_state.All, newState.All, state.All) != state.All)
+				{
+					// Our attempt to increment the busy count failed, Loop again and retry.
+					sw.SpinOnce();
+					continue;
+				}
+
+				break;
+			}
+
+			// There may be waiters because we raised the busy count (and failed). Release one waiter if there is one.
+			if (m_waiting.TryDequeue(out var waitingOpenAttempt))
+			{
+				var tcs = waitingOpenAttempt.TaskCompletionSource;
+
+#if !NET45
+				if (!tcs.TrySetResult(null)) // Open attempt is sync
+				{
+					// TODO: Release more??
+				}
+#else
+				// We have a pending open attempt. "Complete" it, handing off the session.
+				if (waitingOpenAttempt.IsAsync)
+				{
+					// If the waiting open attempt is asynchronous (i.e. OpenAsync()), we can't simply
+					// call SetResult on its TaskCompletionSource, since it would execute the open's
+					// continuation in our thread (the closing thread). Instead we schedule the completion
+					// to run in the thread pool via Task.Run().
+
+					// TODO: When we drop support for .NET Framework 4.5, switch to RunContinuationsAsynchronously
+					Task.Run(() =>
+					{
+						if (!tcs.TrySetResult(null))
+						{
+							// TODO: Release more??
+						}
+					});
+				}
+				else if (!tcs.TrySetResult(null)) // Open attempt is sync
+				{
+					// TODO: Release more??
+				}
+#endif
+			}
+		}
+
+		private void CloseSession(ServerSession session, bool wasIdle)
+		{
+			try
+			{
+				session.DisposeAsync(IOBehavior.Synchronous, CancellationToken.None).GetAwaiter().GetResult();
+
+				var sw = new SpinWait();
+				while (true)
+				{
+					var state = m_state.Copy();
+					var newState = state;
+					if (wasIdle)
+						newState.Idle--;
+					else
+						newState.Busy--;
+					CheckInvariants(newState);
+					if (Interlocked.CompareExchange(ref m_state.All, newState.All, state.All) == state.All)
+						break;
+					sw.SpinOnce();
+				}
+			}
+			catch (Exception e)
+			{
+				Log.Warn("Exception while closing outdated session", e, session.Id);
+			}
+
+			while (m_pruningTimer != null && m_state.Total <= m_minimumPoolSize)
+			{
+				var oldTimer = m_pruningTimer;
+				if (object.ReferenceEquals(Interlocked.CompareExchange(ref m_pruningTimer, null, oldTimer), oldTimer))
+				{
+					oldTimer.Dispose();
+					break;
+				}
+			}
+		}
+
+		private void PruneIdleConnectors(object _)
+		{
+			var idleLifetime = ConnectionSettings.ConnectionIdleTimeout;
+
+			// prune from the back of the array, which is likely to have the oldest sessions
+			for (var i = m_idleSessions.Length -1; i >= 0; i--)
+			{
+				if (m_state.Total <= m_minimumPoolSize)
+					return;
+
+				var session = m_idleSessions[i];
+				if (session is null || ((unchecked((uint) Environment.TickCount) - session.LastReturnedTicks) / 1000) < idleLifetime)
+					continue;
+				if (Interlocked.CompareExchange(ref m_idleSessions[i], null, session) == session)
+					CloseSession(session, wasIdle: true);
+			}
+		}
+
+		private void Clear()
+		{
+			for (var i = 0; i < m_idleSessions.Length; i++)
+			{
+				var session = Interlocked.Exchange(ref m_idleSessions[i], null);
+				if (session != null)
+					CloseSession(session, wasIdle: true);
+			}
+
+			Interlocked.Increment(ref m_generation);
+		}
+
+		[Conditional("DEBUG")]
+		private void CheckInvariants(PoolState state)
+		{
+			if (state.Total > m_maximumPoolSize)
+				throw new InvalidOperationException($"Pool is over capacity (Total={state.Total}, Max={m_maximumPoolSize})");
+			if (state.Waiting > 0 && state.Idle > 0)
+				throw new InvalidOperationException($"Can't have waiters ({state.Waiting}) while there are idle connections ({state.Idle}");
+			if (state.Idle < 0)
+				throw new InvalidOperationException("Idle is negative");
+			if (state.Busy < 0)
+				throw new InvalidOperationException("Busy is negative");
+			if (state.Waiting < 0)
+				throw new InvalidOperationException("Waiting is negative");
+		}
+
 		static readonly IMySqlConnectorLogger Log = MySqlConnectorLogManager.CreateLogger(nameof(ConnectionPool));
 		static readonly ConcurrentDictionary<string, ConnectionPool> s_pools = new ConcurrentDictionary<string, ConnectionPool>();
 
@@ -539,16 +897,24 @@ namespace MySqlConnector.Core
 		static ConnectionStringPool s_mruCache;
 
 		int m_generation;
-		readonly SemaphoreSlim m_cleanSemaphore;
-		readonly SemaphoreSlim m_sessionSemaphore;
-		readonly LinkedList<ServerSession> m_sessions;
-		readonly Dictionary<string, ServerSession> m_leasedSessions;
+		readonly int m_maximumPoolSize;
+		readonly int m_minimumPoolSize;
+		readonly ServerSession[] m_idleSessions;
+		readonly ConcurrentQueue<OpenAttempt> m_waiting;
+		readonly ServerSession[] m_busySessions;
 		readonly ILoadBalancer m_loadBalancer;
 		readonly Dictionary<string, int> m_hostSessions;
 		readonly object[] m_logArguments;
-		Task m_reaperTask;
+		readonly TimeSpan m_pruningInterval;
+		Timer m_pruningTimer;
 		uint m_lastRecoveryTime;
 		int m_lastSessionId;
 		Dictionary<string, CachedProcedure> m_procedureCache;
+		PoolState m_state;
+
+		/// <summary>
+		/// Maximum number of possible connections in any single pool.
+		/// </summary>
+		internal const int PoolSizeLimit = 4096;
 	}
 }
