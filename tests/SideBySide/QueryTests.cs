@@ -1029,6 +1029,18 @@ insert into has_rows(value) values(1),(2),(3);");
 			Assert.Contains("CREATE", table.Rows.Cast<DataRow>().Select(x => (string) x[0]));
 #endif
 		}
+
+		[Fact]
+		public void RestrictionsSchema()
+		{
+			var table = m_database.Connection.GetSchema("Restrictions");
+			Assert.NotNull(table);
+			Assert.Equal(4, table.Columns.Count);
+			Assert.Equal("CollectionName", table.Columns[0].ColumnName);
+			Assert.Equal("RestrictionName", table.Columns[1].ColumnName);
+			Assert.Equal("RestrictionDefault", table.Columns[2].ColumnName);
+			Assert.Equal("RestrictionNumber", table.Columns[3].ColumnName);
+		}
 #endif
 
 		[Fact]
